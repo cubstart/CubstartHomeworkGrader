@@ -1,19 +1,19 @@
 const $ = (s) => document.querySelector(s);
-const state = { filesOrigin: '', assignment: null, subs: [], sub: null, files: [], entry: null, file: null };
+const state = { assignment: null, subs: [], sub: null, files: [], entry: null, file: null, port: null };
 
 const IMG = /\.(png|jpe?g|gif|svg|webp|ico|bmp|avif)$/i;
 const MEDIA = /\.(mp4|webm|mov|mp3|wav|ogg)$/i;
 const BINARY = /\.(pdf|zip|woff2?|ttf|otf|eot)$/i;
 const LANG = { js: 'javascript', mjs: 'javascript', jsx: 'javascript', ts: 'typescript', css: 'css', html: 'xml', htm: 'xml', json: 'json', md: 'markdown', py: 'python', svg: 'xml' };
 
-const fileUrl = (p) => `${state.filesOrigin}/${state.assignment}/${state.sub.id}/${p.split('/').map(encodeURIComponent).join('/')}`;
+// Each submission is served from its own port (its own origin) on the same loopback host as the UI
+const fileUrl = (p) => `${location.protocol}//${location.hostname}:${state.port}/${p.split('/').map(encodeURIComponent).join('/')}`;
 const api = (p, opts) => fetch(p, opts).then((r) => r.json());
 
 // ---------- Login ----------
 
 async function refreshStatus() {
   const s = await api('/api/status');
-  state.filesOrigin = s.filesOrigin;
   const el = $('#loginStatus');
   el.textContent = s.loggedIn ? 'Logged in' : 'Not logged in';
   el.className = 'pill ' + (s.loggedIn ? 'ok' : 'bad');
@@ -21,7 +21,7 @@ async function refreshStatus() {
 }
 
 $('#loginBtn').onclick = async () => {
-  await api('/api/login', { method: 'POST' });
+  await api('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
   $('#loginStatus').textContent = 'Log in in the Chromium window…';
   const t = setInterval(async () => { if (await refreshStatus()) clearInterval(t); }, 3000);
 };
@@ -91,7 +91,8 @@ $('#subList').onclick = (e) => { const li = e.target.closest('li'); if (li) sele
 async function selectSub(id) {
   state.sub = state.subs.find((s) => s.id === id);
   renderSubs();
-  const { files, entry } = await api(`/api/assignments/${state.assignment}/${id}/files`);
+  const { files, entry, port } = await api(`/api/assignments/${state.assignment}/${id}/files`);
+  state.port = port;
   state.files = files;
   state.entry = entry;
   renderTree();

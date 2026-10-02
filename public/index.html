@@ -42,10 +42,11 @@
       <button data-tab="preview" class="active">Preview</button>
       <button data-tab="source">Source</button>
       <span id="current"></span>
-      <a id="openTab" target="_blank" hidden>Open in new tab ↗</a>
+      <a id="openTab" target="_blank" rel="noopener noreferrer" hidden>Open in new tab ↗</a>
     </div>
     <div id="previewPane" class="pane">
-      <iframe id="frame"></iframe>
+      <!-- Student code: no top navigation or popups. allow-same-origin is safe because it runs on its own port, not the UI's origin -->
+      <iframe id="frame" sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-downloads"></iframe>
       <div id="noPreview" class="empty" hidden>No HTML file in this submission.</div>
     </div>
     <div id="sourcePane" class="pane" hidden>

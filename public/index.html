@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cubstart Grader</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <strong>Cubstart Grader</strong>
+  <input id="url" placeholder="https://www.gradescope.com/courses/123/assignments/456 (or …/submissions/789)">
+  <button id="fetchBtn">Fetch submissions</button>
+  <button id="loginBtn" class="secondary">Log in to Gradescope</button>
+  <span id="loginStatus" class="pill">checking…</span>
+</header>
+
+<div id="progress" hidden>
+  <div class="bar"><div id="barFill"></div></div>
+  <pre id="log"></pre>
+</div>
+
+<main>
+  <aside id="students">
+    <select id="assignment"></select>
+    <input id="filter" placeholder="Filter students…">
+    <ul id="subList"></ul>
+    <p class="hint">j / k to switch students</p>
+  </aside>
+  <div class="gutter" data-var="--w-students" title="Drag to resize"></div>
+
+  <aside id="tree">
+    <div class="paneTitle">Files</div>
+    <ul id="fileList"></ul>
+  </aside>
+  <div class="gutter" data-var="--w-tree" title="Drag to resize"></div>
+
+  <section id="viewer">
+    <div class="tabs">
+      <button data-tab="preview" class="active">Preview</button>
+      <button data-tab="source">Source</button>
+      <span id="current"></span>
+      <a id="openTab" target="_blank" hidden>Open in new tab ↗</a>
+    </div>
+    <div id="previewPane" class="pane">
+      <iframe id="frame"></iframe>
+      <div id="noPreview" class="empty" hidden>No HTML file in this submission.</div>
+    </div>
+    <div id="sourcePane" class="pane" hidden>
+      <div id="sourceBody" class="empty">Pick a file on the left.</div>
+    </div>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

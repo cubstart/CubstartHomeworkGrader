@@ -11,10 +11,11 @@
 <body>
 <header>
   <strong>Cubstart Grader</strong>
-  <input id="url" placeholder="https://www.gradescope.com/courses/123/assignments/456 (or …/submissions/789)">
-  <button id="fetchBtn">Fetch submissions</button>
-  <button id="loginBtn" class="secondary">Log in to Gradescope</button>
-  <span id="loginStatus" class="pill">checking…</span>
+  <label id="dropZone" title="Gradescope → Assignment → Review Grades → Export Submissions">
+    <input id="zipInput" type="file" accept=".zip,application/zip" hidden>
+    Drop a Gradescope submissions export (.zip) here, or <u>browse</u>
+  </label>
+  <button id="importBtn">Import zip</button>
 </header>
 
 <div id="progress" hidden>

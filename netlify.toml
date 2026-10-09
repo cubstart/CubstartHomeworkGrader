@@ -1,0 +1,23 @@
+# Netlify serves only the static frontend in public/.
+# The Express backend (server.js) is NOT deployed by this config: it unpacks uploaded
+# submission exports into data/ on local disk and listens on a second port for student
+# files, neither of which works in Netlify's static hosting or serverless functions.
+
+[build]
+  publish = "public"
+  command = ""
+
+# To make the frontend usable, host server.js somewhere with a persistent
+# filesystem (e.g. Render, Fly.io, a VPS) and proxy API calls to it:
+#
+# [[redirects]]
+#   from = "/api/*"
+#   to = "https://YOUR-BACKEND-HOST/api/:splat"
+#   status = 200
+#   force = true
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"

@@ -9,52 +9,60 @@ const LANG = { js: 'javascript', mjs: 'javascript', jsx: 'javascript', ts: 'type
 const fileUrl = (p) => `${state.filesOrigin}/${state.assignment}/${state.sub.id}/${p.split('/').map(encodeURIComponent).join('/')}`;
 const api = (p, opts) => fetch(p, opts).then((r) => r.json());
 
-// ---------- Login ----------
+// ---------- Importing ----------
 
-async function refreshStatus() {
-  const s = await api('/api/status');
-  state.filesOrigin = s.filesOrigin;
-  const el = $('#loginStatus');
-  el.textContent = s.loggedIn ? 'Logged in' : 'Not logged in';
-  el.className = 'pill ' + (s.loggedIn ? 'ok' : 'bad');
-  return s.loggedIn;
+async function loadStatus() {
+  state.filesOrigin = (await api('/api/status')).filesOrigin;
 }
 
-$('#loginBtn').onclick = async () => {
-  await api('/api/login', { method: 'POST' });
-  $('#loginStatus').textContent = 'Log in in the Chromium window…';
-  const t = setInterval(async () => { if (await refreshStatus()) clearInterval(t); }, 3000);
-};
-
-// ---------- Fetching ----------
-
-$('#fetchBtn').onclick = async () => {
-  const url = $('#url').value.trim();
-  if (!url) return;
-  $('#fetchBtn').disabled = true;
+async function importZip(file) {
+  if (!file || $('#importBtn').disabled) return;
+  if (!/\.zip$/i.test(file.name)) { alert('Please choose a .zip file (Gradescope → Review Grades → Export Submissions).'); return; }
+  $('#importBtn').disabled = true;
   $('#progress').hidden = false;
-  $('#log').textContent = '';
-  const { jobId } = await api('/api/fetch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) });
+  $('#barFill').style.width = '0';
+  $('#log').textContent = `Uploading ${file.name} (${(file.size / 1e6).toFixed(1)} MB)…`;
+  const done = () => { $('#importBtn').disabled = false; $('#zipInput').value = ''; };
+  const res = await api('/api/import', { method: 'POST', headers: { 'Content-Type': 'application/zip', 'X-Filename': encodeURIComponent(file.name) }, body: file })
+    .catch((e) => ({ error: e.message }));
+  if (!res.jobId) { $('#log').textContent += `\nError: ${res.error || 'upload failed'}`; return done(); }
   const t = setInterval(async () => {
-    const j = await api(`/api/jobs/${jobId}`);
+    const j = await api(`/api/jobs/${res.jobId}`);
     $('#barFill').style.width = j.total ? `${(100 * j.done) / j.total}%` : '0';
     $('#log').textContent = j.logs.join('\n');
     $('#log').scrollTop = 1e9;
     if (j.status !== 'running') {
       clearInterval(t);
-      $('#fetchBtn').disabled = false;
+      done();
       if (j.assignmentId) await loadAssignments(j.assignmentId);
     }
-  }, 1000);
-};
+  }, 500);
+}
+
+$('#importBtn').onclick = () => $('#zipInput').click();
+$('#zipInput').onchange = (e) => importZip(e.target.files[0]);
+
+// Accept a drop anywhere in the window
+let dragDepth = 0;
+const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes('Files');
+window.addEventListener('dragenter', (e) => { if (hasFiles(e)) { dragDepth++; document.body.classList.add('dropping'); } });
+window.addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove('dropping'); } });
+window.addEventListener('dragover', (e) => { if (hasFiles(e)) e.preventDefault(); });
+window.addEventListener('drop', (e) => {
+  if (!hasFiles(e)) return;
+  e.preventDefault();
+  dragDepth = 0;
+  document.body.classList.remove('dropping');
+  importZip(e.dataTransfer.files[0]);
+});
 
 // ---------- Assignments & submissions ----------
 
 async function loadAssignments(select) {
   const list = await api('/api/assignments');
   $('#assignment').innerHTML = list.length
-    ? list.map((a) => `<option value="${a.assignmentId}">Assignment ${a.assignmentId} (${a.count})</option>`).join('')
-    : '<option>No assignments fetched yet</option>';
+    ? list.map((a) => `<option value="${esc(a.assignmentId)}">Assignment ${esc(a.assignmentId)} (${a.count})</option>`).join('')
+    : '<option>No assignments imported yet</option>';
   const pick = select || localStorage.getItem('assignment') || list[0]?.assignmentId;
   if (pick && list.some((a) => a.assignmentId === pick)) {
     $('#assignment').value = pick;
@@ -68,7 +76,6 @@ async function loadAssignment(aid) {
   state.assignment = aid;
   localStorage.setItem('assignment', aid);
   const a = await api(`/api/assignments/${aid}`);
-  if (a.url && !$('#url').value) $('#url').value = a.url;
   state.subs = a.submissions;
   renderSubs();
   if (state.subs.length) selectSub(state.subs[0].id);
@@ -232,4 +239,4 @@ document.addEventListener('keydown', (e) => {
 
 function esc(s) { return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
 
-refreshStatus().then(() => loadAssignments());
+loadStatus().then(() => loadAssignments());

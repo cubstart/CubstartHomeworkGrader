@@ -1,11 +1,11 @@
 const express = require('express');
+const http = require('http');
 const path = require('path');
 const fs = require('fs');
 const AdmZip = require('adm-zip');
 const yaml = require('js-yaml');
 
 const PORT = Number(process.env.PORT) || 3000;
-const FILES_PORT = PORT + 1; // student code is served from a separate origin so it can't touch the app's API
 const ROOT = __dirname;
 const DATA_DIR = path.join(ROOT, 'data');
 
@@ -15,25 +15,36 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const IGNORED = /(^|\/)(__MACOSX|\.DS_Store|node_modules|\.git)(\/|$)/;
 
-function writeEntry(destDir, name, data, depth) {
-  const out = path.resolve(destDir, name);
-  if (!out.startsWith(path.resolve(destDir) + path.sep)) return; // zip-slip guard
-  // Students often upload a zip of their project; unpack nested zips in place
-  if (depth < 3 && /\.zip$/i.test(name)) {
-    try {
-      extractZip(data, out.replace(/\.zip$/i, ''), depth + 1);
-      return;
-    } catch { /* not a valid zip, keep it as a file */ }
-  }
-  fs.mkdirSync(path.dirname(out), { recursive: true });
-  fs.writeFileSync(out, data);
-}
+// Zip-bomb limits per submission, shared across nested zips
+const MAX_UNZIPPED_BYTES = 200 * 1024 * 1024;
+const MAX_ZIP_ENTRIES = 5000;
+class ZipLimitError extends Error {}
 
-function extractZip(buf, destDir, depth = 0) {
-  for (const entry of new AdmZip(buf).getEntries()) {
+function extractZip(buf, destDir, depth = 0, budget = { bytes: MAX_UNZIPPED_BYTES, entries: MAX_ZIP_ENTRIES }) {
+  const zip = new AdmZip(buf);
+  for (const entry of zip.getEntries()) {
     const name = entry.entryName.replace(/\\/g, '/');
     if (entry.isDirectory || IGNORED.test(name)) continue;
-    writeEntry(destDir, name, entry.getData(), depth);
+    const out = path.resolve(destDir, name);
+    if (!out.startsWith(path.resolve(destDir) + path.sep)) continue; // zip-slip guard
+    if (--budget.entries < 0) throw new ZipLimitError(`Submission has more than ${MAX_ZIP_ENTRIES} files`);
+    // Check the declared size before inflating, then the real one (headers can lie)
+    const tooBig = () => new ZipLimitError(`Submission is larger than ${MAX_UNZIPPED_BYTES / 1024 / 1024} MB unzipped`);
+    if (entry.header.size > budget.bytes) throw tooBig();
+    const data = entry.getData();
+    if ((budget.bytes -= data.length) < 0) throw tooBig();
+    // Students often upload a zip of their project; unpack nested zips in place
+    if (depth < 3 && /\.zip$/i.test(name)) {
+      try {
+        extractZip(data, out.replace(/\.zip$/i, ''), depth + 1, budget);
+        continue;
+      } catch (e) {
+        if (e instanceof ZipLimitError) throw e;
+        /* not a valid zip, keep it as a file */
+      }
+    }
+    fs.mkdirSync(path.dirname(out), { recursive: true });
+    fs.writeFileSync(out, data);
   }
 }
 
@@ -144,18 +155,107 @@ async function runImport(job, buf, filename) {
   return assignmentId;
 }
 
+// ---------- Network guards ----------
+
+const LOOPBACK_HOSTS = ['localhost', '127.0.0.1', '[::1]'];
+const APP_ORIGINS = new Set(LOOPBACK_HOSTS.map((h) => `http://${h}:${PORT}`));
+
+// IPv4 (any 127.x), IPv6, and IPv4-mapped IPv6 (::ffff:127.0.0.1) loopback addresses
+const isLoopback = (addr = '') => addr === '::1' || /^(::ffff:)?127\./.test(addr);
+
+// Only this machine may connect, and only under a loopback hostname. The Host check stops
+// DNS rebinding, where a website points its own domain at 127.0.0.1 to read our responses.
+function localOnly(req, res, next) {
+  const port = req.socket.localPort;
+  const host = String(req.headers.host || '').toLowerCase();
+  if (!isLoopback(req.socket.remoteAddress) || !LOOPBACK_HOSTS.some((h) => host === `${h}:${port}`)) {
+    return res.status(403).send('Forbidden');
+  }
+  next();
+}
+
+// Binds the IPv4 and IPv6 loopback addresses so "localhost" works whichever one the OS
+// resolves it to. Never binds a network-facing address. IPv6 is optional: machines without
+// it keep the IPv4 listener, and browsers fall back to it.
+function listenLoopback(handler, port) {
+  return new Promise((resolve, reject) => {
+    const v4 = http.createServer(handler);
+    v4.once('error', reject);
+    v4.listen(port, '127.0.0.1', () => {
+      const actual = v4.address().port;
+      const v6 = http.createServer(handler);
+      v6.once('error', () => resolve({ port: actual, servers: [v4] }));
+      v6.listen(actual, '::1', () => resolve({ port: actual, servers: [v4, v6] }));
+    });
+  });
+}
+
+// ---------- Preview servers ----------
+
+// Each submission is served on its own loopback port, i.e. its own browser origin, so student
+// code can't read other submissions, and its localStorage stays separate from theirs.
+const MAX_PREVIEWS = 50;
+const previews = new Map(); // "aid/sid" -> Promise<{ port, servers }>, oldest first
+
+function previewApp(dir) {
+  const app = express();
+  app.use(localOnly);
+  app.use((req, res, next) => {
+    // A service worker outlives the preview and could rewrite what the grader sees
+    if (req.get('Service-Worker')) return res.status(403).end();
+    // Only the grader UI may read files cross-origin (for the Source tab)
+    const origin = req.get('Origin');
+    if (APP_ORIGINS.has(origin)) res.set('Access-Control-Allow-Origin', origin);
+    res.vary('Origin');
+    next();
+  });
+  app.use(express.static(dir, { dotfiles: 'allow' }));
+  return app;
+}
+
+function previewPort(aid, sid) {
+  const key = `${aid}/${sid}`;
+  let p = previews.get(key);
+  if (p) previews.delete(key); // re-inserted below as most recently used
+  else {
+    p = listenLoopback(previewApp(path.join(DATA_DIR, aid, sid)), 0);
+    p.catch(() => { if (previews.get(key) === p) previews.delete(key); });
+  }
+  previews.set(key, p);
+  if (previews.size > MAX_PREVIEWS) {
+    const [oldKey, old] = previews.entries().next().value;
+    previews.delete(oldKey);
+    old.then(({ servers }) => servers.forEach((s) => { s.close(); s.closeAllConnections(); })).catch(() => {});
+  }
+  return p.then((r) => r.port);
+}
+
 // ---------- App ----------
 
 const app = express();
+app.use(localOnly);
+// A cross-site page can send a form POST without a CORS preflight; requiring JSON forces
+// a preflight, which fails because this server sends no CORS headers
+app.use((req, res, next) => (['GET', 'HEAD'].includes(req.method) || req.is('application/json') ? next() : res.status(415).end()));
+app.use(express.json());
 app.use(express.static(path.join(ROOT, 'public')));
 
-app.get('/api/status', (req, res) => {
-  res.json({ filesOrigin: `http://localhost:${FILES_PORT}` });
+app.get('/api/status', async (req, res) => {
+  try { res.json({ loggedIn: await isLoggedIn() }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/import', express.raw({ type: () => true, limit: '1gb' }), (req, res) => {
-  if (!Buffer.isBuffer(req.body) || !req.body.length) return res.status(400).json({ error: 'Empty upload' });
-  const filename = path.basename(decodeURIComponent(req.get('X-Filename') || 'upload.zip'));
+app.post('/api/login', async (req, res) => {
+  try {
+    const ctx = await getContext({ headed: true });
+    const page = await ctx.newPage();
+    await page.goto(`${GS}/login`);
+    await page.bringToFront();
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/fetch', (req, res) => {
   const id = String(Date.now());
   const job = { id, status: 'running', total: 0, done: 0, logs: [], assignmentId: null };
   job.log = (m) => job.logs.push(m);
@@ -191,17 +291,19 @@ app.get('/api/assignments/:aid', (req, res) => {
   res.json({ ...m, submissions: subs });
 });
 
-app.get('/api/assignments/:aid/:sid/files', (req, res) => {
-  const dir = path.join(DATA_DIR, path.basename(req.params.aid), path.basename(req.params.sid));
-  if (!fs.existsSync(dir)) return res.json({ files: [], entry: null });
-  const files = walk(dir);
-  res.json({ files, entry: findEntryHtml(files) });
+app.get('/api/assignments/:aid/:sid/files', async (req, res) => {
+  const aid = path.basename(req.params.aid);
+  const sid = path.basename(req.params.sid);
+  const dir = path.join(DATA_DIR, aid, sid);
+  if (!fs.existsSync(dir)) return res.json({ files: [], entry: null, port: null });
+  try {
+    const files = walk(dir);
+    res.json({ files, entry: findEntryHtml(files), port: await previewPort(aid, sid) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.listen(PORT, () => console.log(`Grader UI:      http://localhost:${PORT}`));
+listenLoopback(app, PORT)
+  .then(() => console.log(`Grader UI: http://localhost:${PORT}`))
+  .catch((e) => { console.error(`Could not start on port ${PORT}: ${e.message}`); process.exit(1); });
 
-// Raw student files (HTML/JS/CSS/assets), served on a different origin
-const files = express();
-files.use((req, res, next) => { res.set('Access-Control-Allow-Origin', '*'); next(); });
-files.use(express.static(DATA_DIR, { dotfiles: 'allow' }));
-files.listen(FILES_PORT, () => console.log(`Student files:  http://localhost:${FILES_PORT}`));
+process.on('SIGINT', async () => { if (context) await context.close().catch(() => {}); process.exit(0); });

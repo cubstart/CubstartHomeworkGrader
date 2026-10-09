@@ -16,6 +16,7 @@
     Drop a Gradescope submissions export (.zip) here, or <u>browse</u>
   </label>
   <button id="importBtn">Import zip</button>
+  <span id="dbStatus" class="pill">checking…</span>
 </header>
 
 <div id="progress" hidden>
@@ -27,8 +28,12 @@
   <aside id="students">
     <select id="assignment"></select>
     <input id="filter" placeholder="Filter students…">
+    <div class="gradeBar">
+      <span id="gradedCount"></span>
+      <label><input type="checkbox" id="hideGraded"> Hide graded</label>
+    </div>
     <ul id="subList"></ul>
-    <p class="hint">j / k to switch students</p>
+    <p class="hint">j / k to switch students · g to mark graded</p>
   </aside>
   <div class="gutter" data-var="--w-students" title="Drag to resize"></div>
 
@@ -44,6 +49,7 @@
       <button data-tab="source">Source</button>
       <span id="current"></span>
       <a id="openTab" target="_blank" rel="noopener noreferrer" hidden>Open in new tab ↗</a>
+      <button id="gradeBtn" class="secondary" hidden>Mark graded</button>
     </div>
     <div id="previewPane" class="pane">
       <!-- Student code: no top navigation or popups. allow-same-origin is safe because it runs on its own port, not the UI's origin -->

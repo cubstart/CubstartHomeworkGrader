@@ -1,6 +1,6 @@
 # CubstartHomeworkGrader
 
-This project is designed to streamline the process of downloading and viewing student submissions for grading.
+This project is designed to streamline the process of viewing student submissions for grading.
 
 ## Requirements
 
@@ -14,11 +14,18 @@ cd CubstartHomeworkGrader
 npm install
 ```
 
-`npm install` also downloads the Chromium browser that Playwright uses to talk to Gradescope (via the `postinstall` script). If that step is skipped or fails, run it manually:
+## Grading status (MongoDB, optional)
+
+To track which students have been graded, shared across every grader, copy `.env.example` to `.env` and fill it in:
 
 ```sh
-npx playwright install chromium
+MONGODB_URI=mongodb+srv://user:password@cluster.example.mongodb.net/
+# Optional: database name (default cubstart-grader) and the name recorded as grader (default: your OS username)
+MONGODB_DB=cubstart-grader
+GRADER_NAME=Your Name
 ```
+
+Statuses are stored in the `grades` collection, one document per assignment and submission (`assignmentId`, `submissionId`, `graded`, `gradedBy`, `updatedAt`, plus the student's name and email). Without `MONGODB_URI` everything else still works; the header just shows "Grading status off".
 
 ## Running
 
@@ -26,7 +33,9 @@ npx playwright install chromium
 npm start        # or: npm run start
 ```
 
-Then open <http://localhost:3000> and click **Log in to Gradescope**. A browser window opens; sign in there, and the login is saved in `.gradescope-profile/` for future runs.
+Then open <http://localhost:3000>. In Gradescope, open the assignment → **Review Grades** → **Export Submissions**, and drop the downloaded zip onto the page (or click **Import zip**). Re-importing an assignment's export replaces the earlier import; grading status is kept.
+
+Mark a student graded with the **Mark graded** button or the `g` key. Graded students get a ✓, **Hide graded** filters them out, and other graders' changes show up within about 10 seconds.
 
 The grader UI runs on port `3000`. To use a different port, set `PORT`:
 
@@ -35,7 +44,7 @@ PORT=4000 npm start          # macOS/Linux
 $env:PORT=4000; npm start    # Windows PowerShell
 ```
 
-Downloaded submissions are stored in `data/`.
+Imported submissions are stored in `data/`.
 
 ## Security
 

@@ -1,9 +1,13 @@
 const express = require('express');
 const http = require('http');
+const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const AdmZip = require('adm-zip');
 const yaml = require('js-yaml');
+const { MongoClient } = require('mongodb');
+
+try { process.loadEnvFile(path.join(__dirname, '.env')); } catch { /* no .env file */ }
 
 const PORT = Number(process.env.PORT) || 3000;
 const ROOT = __dirname;
@@ -20,31 +24,35 @@ const MAX_UNZIPPED_BYTES = 200 * 1024 * 1024;
 const MAX_ZIP_ENTRIES = 5000;
 class ZipLimitError extends Error {}
 
-function extractZip(buf, destDir, depth = 0, budget = { bytes: MAX_UNZIPPED_BYTES, entries: MAX_ZIP_ENTRIES }) {
-  const zip = new AdmZip(buf);
-  for (const entry of zip.getEntries()) {
-    const name = entry.entryName.replace(/\\/g, '/');
-    if (entry.isDirectory || IGNORED.test(name)) continue;
-    const out = path.resolve(destDir, name);
-    if (!out.startsWith(path.resolve(destDir) + path.sep)) continue; // zip-slip guard
-    if (--budget.entries < 0) throw new ZipLimitError(`Submission has more than ${MAX_ZIP_ENTRIES} files`);
-    // Check the declared size before inflating, then the real one (headers can lie)
-    const tooBig = () => new ZipLimitError(`Submission is larger than ${MAX_UNZIPPED_BYTES / 1024 / 1024} MB unzipped`);
-    if (entry.header.size > budget.bytes) throw tooBig();
-    const data = entry.getData();
-    if ((budget.bytes -= data.length) < 0) throw tooBig();
-    // Students often upload a zip of their project; unpack nested zips in place
-    if (depth < 3 && /\.zip$/i.test(name)) {
-      try {
-        extractZip(data, out.replace(/\.zip$/i, ''), depth + 1, budget);
-        continue;
-      } catch (e) {
-        if (e instanceof ZipLimitError) throw e;
-        /* not a valid zip, keep it as a file */
-      }
+const newBudget = () => ({ bytes: MAX_UNZIPPED_BYTES, entries: MAX_ZIP_ENTRIES });
+
+function writeEntry(destDir, name, entry, depth, budget) {
+  if (IGNORED.test(name)) return;
+  const out = path.resolve(destDir, name);
+  if (!out.startsWith(path.resolve(destDir) + path.sep)) return; // zip-slip guard
+  if (--budget.entries < 0) throw new ZipLimitError(`Submission has more than ${MAX_ZIP_ENTRIES} files`);
+  // Check the declared size before inflating, then the real one (headers can lie)
+  const tooBig = () => new ZipLimitError(`Submission is larger than ${MAX_UNZIPPED_BYTES / 1024 / 1024} MB unzipped`);
+  if (entry.header.size > budget.bytes) throw tooBig();
+  const data = entry.getData();
+  if ((budget.bytes -= data.length) < 0) throw tooBig();
+  // Students often upload a zip of their project; unpack nested zips in place
+  if (depth < 3 && /\.zip$/i.test(name)) {
+    try {
+      extractZip(data, out.replace(/\.zip$/i, ''), depth + 1, budget);
+      return;
+    } catch (e) {
+      if (e instanceof ZipLimitError) throw e;
+      /* not a valid zip, keep it as a file */
     }
-    fs.mkdirSync(path.dirname(out), { recursive: true });
-    fs.writeFileSync(out, data);
+  }
+  fs.mkdirSync(path.dirname(out), { recursive: true });
+  fs.writeFileSync(out, data);
+}
+
+function extractZip(buf, destDir, depth = 0, budget = newBudget()) {
+  for (const entry of new AdmZip(buf).getEntries()) {
+    if (!entry.isDirectory) writeEntry(destDir, entry.entryName.replace(/\\/g, '/'), entry, depth, budget);
   }
 }
 
@@ -138,13 +146,15 @@ async function runImport(job, buf, filename) {
 
   for (const s of subs) {
     const { files, ...info } = s;
+    const dir = path.join(assignDir, s.id);
     try {
       if (!files.length) throw new Error('No files in this submission');
-      const dir = path.join(assignDir, s.id);
-      for (const f of files) if (!IGNORED.test(f.name)) writeEntry(dir, f.name, f.entry.getData(), 0);
+      const budget = newBudget();
+      for (const f of files) writeEntry(dir, f.name, f.entry, 0, budget);
       manifest.submissions[s.id] = info;
       job.log(`✓ ${s.name}`);
     } catch (e) {
+      fs.rmSync(dir, { recursive: true, force: true }); // don't leave half a submission behind
       manifest.submissions[s.id] = { ...info, error: e.message };
       job.log(`✗ ${s.name}: ${e.message}`);
     }
@@ -153,6 +163,48 @@ async function runImport(job, buf, filename) {
   }
   fs.writeFileSync(path.join(assignDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
   return assignmentId;
+}
+
+// ---------- Grading status (MongoDB) ----------
+
+// Lives in MongoDB rather than data/ so every grader sees the same status. Set in .env:
+//   MONGODB_URI  connection string (required to enable grading status)
+//   MONGODB_DB   database name, default "cubstart-grader"
+//   GRADER_NAME  who is recorded as the grader, default your OS username
+const GRADER = process.env.GRADER_NAME || os.userInfo().username;
+const db = { client: null, grades: null, status: process.env.MONGODB_URI ? 'connecting' : 'not configured', error: null };
+
+async function connectDb() {
+  if (!process.env.MONGODB_URI) return;
+  db.status = 'connecting';
+  try {
+    const client = new MongoClient(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 10000, appName: 'cubstart-grader' });
+    await client.connect();
+    const grades = client.db(process.env.MONGODB_DB || 'cubstart-grader').collection('grades');
+    await grades.createIndex({ assignmentId: 1, submissionId: 1 }, { unique: true });
+    Object.assign(db, { client, grades, status: 'connected', error: null });
+    console.log('MongoDB: connected');
+  } catch (e) {
+    Object.assign(db, { status: 'error', error: e.message });
+    console.error(`MongoDB: ${e.message} (retrying in 30s)`);
+    setTimeout(connectDb, 30000).unref();
+  }
+}
+
+function requireDb(req, res, next) {
+  if (db.grades) return next();
+  res.status(503).json({ error: db.error ? `MongoDB: ${db.error}` : 'Grading status needs MONGODB_URI in .env' });
+}
+
+// { submissionId: { graded, gradedBy, updatedAt } } for one assignment
+async function gradesFor(aid) {
+  const docs = await db.grades.find({ assignmentId: aid }, { projection: { _id: 0, submissionId: 1, graded: 1, gradedBy: 1, updatedAt: 1 } }).toArray();
+  return Object.fromEntries(docs.map(({ submissionId, ...g }) => [submissionId, g]));
+}
+
+function readManifest(aid) {
+  const mp = path.join(DATA_DIR, path.basename(aid), 'manifest.json');
+  return fs.existsSync(mp) ? JSON.parse(fs.readFileSync(mp, 'utf8')) : null;
 }
 
 // ---------- Network guards ----------
@@ -234,28 +286,19 @@ function previewPort(aid, sid) {
 
 const app = express();
 app.use(localOnly);
-// A cross-site page can send a form POST without a CORS preflight; requiring JSON forces
-// a preflight, which fails because this server sends no CORS headers
-app.use((req, res, next) => (['GET', 'HEAD'].includes(req.method) || req.is('application/json') ? next() : res.status(415).end()));
+// A cross-site page can send a form POST without a CORS preflight; requiring JSON (or zip,
+// also not a "simple" type) forces a preflight, which fails because this server sends no CORS headers
+app.use((req, res, next) => (['GET', 'HEAD'].includes(req.method) || req.is('application/json') || req.is('application/zip') ? next() : res.status(415).end()));
 app.use(express.json());
 app.use(express.static(path.join(ROOT, 'public')));
 
-app.get('/api/status', async (req, res) => {
-  try { res.json({ loggedIn: await isLoggedIn() }); }
-  catch (e) { res.status(500).json({ error: e.message }); }
+app.get('/api/status', (req, res) => {
+  res.json({ db: db.status, dbError: db.error, grader: GRADER });
 });
 
-app.post('/api/login', async (req, res) => {
-  try {
-    const ctx = await getContext({ headed: true });
-    const page = await ctx.newPage();
-    await page.goto(`${GS}/login`);
-    await page.bringToFront();
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/fetch', (req, res) => {
+app.post('/api/import', express.raw({ type: 'application/zip', limit: '1gb' }), (req, res) => {
+  if (!Buffer.isBuffer(req.body) || !req.body.length) return res.status(400).json({ error: 'Empty upload' });
+  const filename = path.basename(decodeURIComponent(req.get('X-Filename') || 'upload.zip'));
   const id = String(Date.now());
   const job = { id, status: 'running', total: 0, done: 0, logs: [], assignmentId: null };
   job.log = (m) => job.logs.push(m);
@@ -283,12 +326,37 @@ app.get('/api/assignments', (req, res) => {
   res.json(list);
 });
 
-app.get('/api/assignments/:aid', (req, res) => {
-  const mp = path.join(DATA_DIR, path.basename(req.params.aid), 'manifest.json');
-  if (!fs.existsSync(mp)) return res.status(404).end();
-  const m = JSON.parse(fs.readFileSync(mp, 'utf8'));
-  const subs = Object.values(m.submissions).sort((a, b) => a.name.localeCompare(b.name));
+app.get('/api/assignments/:aid', async (req, res) => {
+  const m = readManifest(req.params.aid);
+  if (!m) return res.status(404).end();
+  // The submission list still loads if MongoDB is down; it just has no grading status
+  const grades = db.grades ? await gradesFor(m.assignmentId).catch(() => ({})) : {};
+  const subs = Object.values(m.submissions)
+    .map((s) => ({ ...s, graded: false, ...grades[s.id] }))
+    .sort((a, b) => a.name.localeCompare(b.name));
   res.json({ ...m, submissions: subs });
+});
+
+// Polled by the UI so other graders' changes show up
+app.get('/api/assignments/:aid/grades', requireDb, async (req, res) => {
+  try { res.json(await gradesFor(path.basename(req.params.aid))); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/api/assignments/:aid/:sid/grade', requireDb, async (req, res) => {
+  const m = readManifest(req.params.aid);
+  const s = m?.submissions[req.params.sid];
+  if (!s) return res.status(404).json({ error: 'Unknown submission' });
+  if (typeof req.body?.graded !== 'boolean') return res.status(400).json({ error: '"graded" must be true or false' });
+  const doc = { graded: req.body.graded, gradedBy: GRADER, updatedAt: new Date() };
+  try {
+    await db.grades.updateOne(
+      { assignmentId: m.assignmentId, submissionId: s.id },
+      { $set: { ...doc, name: s.name, email: s.email }, $setOnInsert: { assignmentId: m.assignmentId, submissionId: s.id } },
+      { upsert: true },
+    );
+    res.json(doc);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/assignments/:aid/:sid/files', async (req, res) => {
@@ -306,4 +374,6 @@ listenLoopback(app, PORT)
   .then(() => console.log(`Grader UI: http://localhost:${PORT}`))
   .catch((e) => { console.error(`Could not start on port ${PORT}: ${e.message}`); process.exit(1); });
 
-process.on('SIGINT', async () => { if (context) await context.close().catch(() => {}); process.exit(0); });
+connectDb();
+
+process.on('SIGINT', async () => { await db.client?.close().catch(() => {}); process.exit(0); });

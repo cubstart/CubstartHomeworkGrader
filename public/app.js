@@ -13,7 +13,14 @@ const api = (p, opts) => fetch(p, opts).then((r) => r.json());
 // ---------- Importing ----------
 
 async function loadStatus() {
-  state.filesOrigin = (await api('/api/status')).filesOrigin;
+  const s = await api('/api/status');
+  state.dbOk = s.db === 'connected';
+  const el = $('#dbStatus');
+  el.textContent = state.dbOk ? `Grading as ${s.grader}` : s.db === 'not configured' ? 'Grading status off' : `MongoDB ${s.db}`;
+  el.title = state.dbOk ? 'Grading status is saved to MongoDB' : s.dbError || 'Set MONGODB_URI in .env to save grading status';
+  el.className = 'pill ' + (state.dbOk ? 'ok' : 'bad');
+  if (s.db === 'connecting') setTimeout(loadStatus, 2000);
+  renderSubs();
 }
 
 async function importZip(file) {
@@ -84,16 +91,59 @@ async function loadAssignment(aid) {
 
 function visibleSubs() {
   const q = $('#filter').value.toLowerCase();
-  return state.subs.filter((s) => `${s.name} ${s.email || ''}`.toLowerCase().includes(q));
+  const hideGraded = $('#hideGraded').checked;
+  // The open student stays listed after being marked graded, so j / k still work from it
+  return state.subs.filter((s) => `${s.name} ${s.email || ''}`.toLowerCase().includes(q) && !(hideGraded && s.graded && s.id !== state.sub?.id));
 }
 
 function renderSubs() {
-  $('#subList').innerHTML = visibleSubs().map((s) =>
-    `<li data-id="${s.id}" class="${s.id === state.sub?.id ? 'active' : ''} ${s.error ? 'err' : ''}" title="${esc(s.error || s.email || s.name)}">${esc(s.name)}</li>`
-  ).join('');
+  $('#subList').innerHTML = visibleSubs().map((s) => {
+    const tip = s.error || [s.email, s.graded && `Graded by ${s.gradedBy || '?'} ${s.updatedAt ? new Date(s.updatedAt).toLocaleString() : ''}`].filter(Boolean).join('\n') || s.name;
+    return `<li data-id="${esc(s.id)}" class="${s.id === state.sub?.id ? 'active' : ''} ${s.error ? 'err' : ''} ${s.graded ? 'graded' : ''}" title="${esc(tip)}"><span class="check">${s.graded ? '✓' : ''}</span>${esc(s.name)}</li>`;
+  }).join('');
+  const graded = state.subs.filter((s) => s.graded).length;
+  $('#gradedCount').textContent = state.dbOk && state.subs.length ? `${graded} / ${state.subs.length} graded` : '';
+  $('#gradeBtn').hidden = !state.dbOk || !state.sub;
+  $('#gradeBtn').textContent = state.sub?.graded ? '✓ Graded' : 'Mark as graded';
+  $('#gradeBtn').title = state.sub?.graded ? `Graded by ${state.sub.gradedBy || '?'}. Click (or press g) to undo` : 'Click or press g';
+  $('#gradeBtn').classList.toggle('done', !!state.sub?.graded);
 }
 
 $('#filter').oninput = renderSubs;
+$('#hideGraded').onchange = renderSubs;
+
+// ---------- Grading status ----------
+
+async function toggleGraded(sub = state.sub) {
+  if (!sub || !state.dbOk) return;
+  const prev = { graded: sub.graded, gradedBy: sub.gradedBy, updatedAt: sub.updatedAt };
+  sub.graded = !sub.graded; // optimistic; reverted below if the save fails
+  renderSubs();
+  try {
+    const r = await fetch(`/api/assignments/${encodeURIComponent(state.assignment)}/${encodeURIComponent(sub.id)}/grade`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ graded: sub.graded }),
+    });
+    const body = await r.json();
+    if (!r.ok) throw new Error(body.error || r.statusText);
+    Object.assign(sub, body);
+  } catch (e) {
+    Object.assign(sub, prev);
+    alert(`Could not save grading status: ${e.message}`);
+  }
+  renderSubs();
+}
+
+$('#gradeBtn').onclick = () => toggleGraded();
+
+// Pick up other graders' changes
+setInterval(async () => {
+  if (!state.dbOk || !state.assignment || document.hidden) return;
+  const aid = state.assignment;
+  const grades = await api(`/api/assignments/${encodeURIComponent(aid)}/grades`).catch(() => null);
+  if (!grades || grades.error || aid !== state.assignment) return;
+  for (const s of state.subs) Object.assign(s, { graded: false, gradedBy: undefined, updatedAt: undefined }, grades[s.id]);
+  renderSubs();
+}, 10000);
 $('#subList').onclick = (e) => { const li = e.target.closest('li'); if (li) selectSub(li.dataset.id); };
 
 async function selectSub(id) {
@@ -131,11 +181,11 @@ $('#fileList').onclick = (e) => {
 // ---------- Viewer ----------
 
 function setTab(tab) {
-  document.querySelectorAll('.tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
+  document.querySelectorAll('.tabs button[data-tab]').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
   $('#previewPane').hidden = tab !== 'preview';
   $('#sourcePane').hidden = tab !== 'source';
 }
-document.querySelectorAll('.tabs button').forEach((b) => (b.onclick = () => setTab(b.dataset.tab)));
+document.querySelectorAll('.tabs button[data-tab]').forEach((b) => (b.onclick = () => setTab(b.dataset.tab)));
 
 function showPreview(switchTab = true) {
   const has = !!state.entry;
@@ -232,6 +282,8 @@ loadWidths();
 
 document.addEventListener('keydown', (e) => {
   if (['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.key === 'g') return toggleGraded();
   if (e.key !== 'j' && e.key !== 'k') return;
   const list = visibleSubs();
   const i = list.findIndex((s) => s.id === state.sub?.id);

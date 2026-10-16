@@ -174,6 +174,20 @@ async function runImport(job, buf, filename) {
 const GRADER = process.env.GRADER_NAME || os.userInfo().username;
 const db = { client: null, grades: null, status: process.env.MONGODB_URI ? 'connecting' : 'not configured', error: null };
 
+// Single-choice rubric, the same for every assignment. Picking an item marks the submission
+// graded with that score; the label is copied onto the grade so it survives edits to this list.
+const RUBRIC = [
+  { points: 5, label: 'Uses all required elements' },
+  { points: 4, label: 'Uses most required elements' },
+  { points: 2, label: 'Uses some required elements' },
+  { points: 0, label: 'No work' },
+];
+const MAX_SCORE = Math.max(...RUBRIC.map((r) => r.points));
+const MAX_COMMENT = 5000;
+
+// Grade fields sent to the UI (not _id, name or email: the manifest already has those)
+const GRADE_FIELDS = { _id: 0, submissionId: 1, graded: 1, score: 1, maxScore: 1, rubric: 1, comment: 1, gradedBy: 1, updatedAt: 1 };
+
 async function connectDb() {
   if (!process.env.MONGODB_URI) return;
   db.status = 'connecting';
@@ -196,9 +210,9 @@ function requireDb(req, res, next) {
   res.status(503).json({ error: db.error ? `MongoDB: ${db.error}` : 'Grading status needs MONGODB_URI in .env' });
 }
 
-// { submissionId: { graded, gradedBy, updatedAt } } for one assignment
+// { submissionId: { graded, score, maxScore, rubric, comment, gradedBy, updatedAt } } for one assignment
 async function gradesFor(aid) {
-  const docs = await db.grades.find({ assignmentId: aid }, { projection: { _id: 0, submissionId: 1, graded: 1, gradedBy: 1, updatedAt: 1 } }).toArray();
+  const docs = await db.grades.find({ assignmentId: aid }, { projection: GRADE_FIELDS }).toArray();
   return Object.fromEntries(docs.map(({ submissionId, ...g }) => [submissionId, g]));
 }
 
@@ -249,6 +263,44 @@ function listenLoopback(handler, port) {
 const MAX_PREVIEWS = 50;
 const previews = new Map(); // "aid/sid" -> Promise<{ port, servers }>, oldest first
 
+// Student pages often reference assets with paths that only worked on their own setup: root-
+// absolute ("/assets/x.jpg" while index.html sits in HW1/), GitHub Pages style
+// ("/repo-name/HW1/assets/x.jpg"), or the wrong letter case. When express.static finds nothing,
+// this looks for the file relative to the entry HTML's folder, then by unique path suffix,
+// ignoring case. Only files that exist inside the submission can match, so nothing escapes it.
+function looseResolver(dir) {
+  let index = null;
+  const build = () => {
+    const files = walk(dir);
+    const entry = findEntryHtml(files) || '';
+    const paths = files.map((f) => f.path);
+    return { paths, entryDir: entry.slice(0, entry.lastIndexOf('/') + 1), lower: new Map(paths.map((p) => [p.toLowerCase(), p])) };
+  };
+  return (reqPath) => {
+    let p;
+    try { p = decodeURIComponent(reqPath).replace(/^[/]+/, ''); } catch { return null; }
+    if (!p) return null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      index ||= build();
+      const { paths, entryDir, lower } = index;
+      let hit = lower.get((entryDir + p).toLowerCase()) || lower.get(p.toLowerCase());
+      // Drop leading folders until exactly one file ends with what is left
+      const parts = p.toLowerCase().split('/');
+      for (let i = 1; i < parts.length && !hit; i++) {
+        const tail = '/' + parts.slice(i).join('/');
+        const found = paths.filter((f) => ('/' + f.toLowerCase()).endsWith(tail));
+        if (found.length === 1) hit = found[0];
+        else if (found.length > 1) break;
+      }
+      if (!hit) return null;
+      const abs = path.join(dir, hit);
+      if (fs.existsSync(abs)) return abs;
+      index = null; // the files changed since indexing (re-import); rebuild once
+    }
+    return null;
+  };
+}
+
 function previewApp(dir) {
   const app = express();
   app.use(localOnly);
@@ -262,6 +314,14 @@ function previewApp(dir) {
     next();
   });
   app.use(express.static(dir, { dotfiles: 'allow' }));
+  const resolve = looseResolver(dir);
+  app.use((req, res, next) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') return next();
+    let file = null;
+    try { file = resolve(req.path); } catch { /* unreadable submission dir: fall through to 404 */ }
+    if (!file) return next();
+    res.sendFile(file, { dotfiles: 'allow' });
+  });
   return app;
 }
 
@@ -293,7 +353,7 @@ app.use(express.json());
 app.use(express.static(path.join(ROOT, 'public')));
 
 app.get('/api/status', (req, res) => {
-  res.json({ db: db.status, dbError: db.error, grader: GRADER });
+  res.json({ db: db.status, dbError: db.error, grader: GRADER, rubric: RUBRIC });
 });
 
 app.post('/api/import', express.raw({ type: 'application/zip', limit: '1gb' }), (req, res) => {
@@ -343,17 +403,48 @@ app.get('/api/assignments/:aid/grades', requireDb, async (req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// The body is a patch holding any of:
+//   { rubric: <index into RUBRIC> }   grade with that item's score
+//   { graded: true | false }          mark graded without a score / clear the grade (the comment stays)
+//   { comment: "..." }                set the comment; an empty string removes it
+// Responds with the saved grade fields (GRADE_FIELDS).
 app.put('/api/assignments/:aid/:sid/grade', requireDb, async (req, res) => {
   const m = readManifest(req.params.aid);
   const s = m?.submissions[req.params.sid];
   if (!s) return res.status(404).json({ error: 'Unknown submission' });
-  if (typeof req.body?.graded !== 'boolean') return res.status(400).json({ error: '"graded" must be true or false' });
-  const doc = { graded: req.body.graded, gradedBy: GRADER, updatedAt: new Date() };
+  const { rubric, graded, comment } = req.body || {};
+  const set = { gradedBy: GRADER, updatedAt: new Date(), name: s.name, email: s.email };
+  const unset = {};
+  let changed = false;
+  if (rubric !== undefined) {
+    if (!Number.isInteger(rubric) || !RUBRIC[rubric]) return res.status(400).json({ error: `"rubric" must be a whole number from 0 to ${RUBRIC.length - 1}` });
+    Object.assign(set, { graded: true, score: RUBRIC[rubric].points, maxScore: MAX_SCORE, rubric: RUBRIC[rubric].label });
+    changed = true;
+  } else if (graded !== undefined) {
+    if (typeof graded !== 'boolean') return res.status(400).json({ error: '"graded" must be true or false' });
+    // The score goes either way: ungrading clears it, and grading without a rubric item must not
+    // bring back a score that an older client left behind when it ungraded
+    set.graded = graded;
+    Object.assign(unset, { score: '', maxScore: '', rubric: '' });
+    changed = true;
+  }
+  if (comment !== undefined) {
+    if (typeof comment !== 'string') return res.status(400).json({ error: '"comment" must be a string' });
+    if (comment.length > MAX_COMMENT) return res.status(400).json({ error: `Comment is longer than ${MAX_COMMENT} characters` });
+    const text = comment.trim();
+    if (text) set.comment = text; else unset.comment = '';
+    changed = true;
+  }
+  if (!changed) return res.status(400).json({ error: 'Nothing to update: send "rubric", "graded" or "comment"' });
+  const onInsert = { assignmentId: m.assignmentId, submissionId: s.id };
+  if (set.graded === undefined) onInsert.graded = false; // a comment alone does not grade
+  const update = { $set: set, $setOnInsert: onInsert };
+  if (Object.keys(unset).length) update.$unset = unset;
   try {
-    await db.grades.updateOne(
+    const doc = await db.grades.findOneAndUpdate(
       { assignmentId: m.assignmentId, submissionId: s.id },
-      { $set: { ...doc, name: s.name, email: s.email }, $setOnInsert: { assignmentId: m.assignmentId, submissionId: s.id } },
-      { upsert: true },
+      update,
+      { upsert: true, returnDocument: 'after', projection: GRADE_FIELDS },
     );
     res.json(doc);
   } catch (e) { res.status(500).json({ error: e.message }); }

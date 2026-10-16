@@ -33,7 +33,7 @@
       <label><input type="checkbox" id="hideGraded"> Hide graded</label>
     </div>
     <ul id="subList"></ul>
-    <p class="hint">j / k to switch students · g to mark graded</p>
+    <p class="hint" id="hint">j / k to switch students · g to mark graded</p>
   </aside>
   <div class="gutter" data-var="--w-students" title="Drag to resize"></div>
 
@@ -58,6 +58,14 @@
     </div>
     <div id="sourcePane" class="pane" hidden>
       <div id="sourceBody" class="empty">Pick a file on the left.</div>
+    </div>
+    <!-- Rubric + comment for the selected student; shown only while MongoDB is connected -->
+    <div id="gradePanel" hidden>
+      <div id="rubric"></div>
+      <div class="commentBox">
+        <textarea id="comment" rows="2" placeholder="Comment for this student (saves on its own)"></textarea>
+        <span id="gradeMeta"></span>
+      </div>
     </div>
   </section>
 </main>

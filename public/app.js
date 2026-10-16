@@ -1,5 +1,5 @@
 const $ = (s) => document.querySelector(s);
-const state = { assignment: null, subs: [], sub: null, files: [], entry: null, file: null, port: null };
+const state = { assignment: null, subs: [], sub: null, files: [], entry: null, file: null, port: null, dbOk: false, rubric: [] };
 
 const IMG = /\.(png|jpe?g|gif|svg|webp|ico|bmp|avif)$/i;
 const MEDIA = /\.(mp4|webm|mov|mp3|wav|ogg)$/i;
@@ -15,6 +15,8 @@ const api = (p, opts) => fetch(p, opts).then((r) => r.json());
 async function loadStatus() {
   const s = await api('/api/status');
   state.dbOk = s.db === 'connected';
+  state.rubric = s.rubric || [];
+  if (state.rubric.length) $('#hint').textContent = `j / k to switch students · 1-${state.rubric.length} to grade · g to toggle graded · Esc leaves the comment box`;
   const el = $('#dbStatus');
   el.textContent = state.dbOk ? `Grading as ${s.grader}` : s.db === 'not configured' ? 'Grading status off' : `MongoDB ${s.db}`;
   el.title = state.dbOk ? 'Grading status is saved to MongoDB' : s.dbError || 'Set MONGODB_URI in .env to save grading status';
@@ -81,6 +83,7 @@ async function loadAssignments(select) {
 $('#assignment').onchange = (e) => loadAssignment(e.target.value);
 
 async function loadAssignment(aid) {
+  if (commentTimer) saveComment(); // unsaved comment for the student we're leaving
   state.assignment = aid;
   localStorage.setItem('assignment', aid);
   const a = await api(`/api/assignments/${aid}`);
@@ -96,44 +99,130 @@ function visibleSubs() {
   return state.subs.filter((s) => `${s.name} ${s.email || ''}`.toLowerCase().includes(q) && !(hideGraded && s.graded && s.id !== state.sub?.id));
 }
 
+// "5/5" for a graded submission with a score (0 is a valid score), else ""
+const scoreOf = (s) => (s.graded && s.score != null ? `${s.score}/${s.maxScore}` : '');
+const when = (d) => (d ? new Date(d).toLocaleString() : '');
+
 function renderSubs() {
   $('#subList').innerHTML = visibleSubs().map((s) => {
-    const tip = s.error || [s.email, s.graded && `Graded by ${s.gradedBy || '?'} ${s.updatedAt ? new Date(s.updatedAt).toLocaleString() : ''}`].filter(Boolean).join('\n') || s.name;
-    return `<li data-id="${esc(s.id)}" class="${s.id === state.sub?.id ? 'active' : ''} ${s.error ? 'err' : ''} ${s.graded ? 'graded' : ''}" title="${esc(tip)}"><span class="check">${s.graded ? '✓' : ''}</span>${esc(s.name)}</li>`;
+    const score = scoreOf(s);
+    const tip = s.error || [
+      s.email,
+      s.graded && `Graded by ${s.gradedBy || '?'} ${when(s.updatedAt)}`,
+      score && `Score ${score}${s.rubric ? ` · ${s.rubric}` : ''}`,
+      s.comment && `Comment: ${s.comment}`,
+    ].filter(Boolean).join('\n') || s.name;
+    return `<li data-id="${esc(s.id)}" class="${s.id === state.sub?.id ? 'active' : ''} ${s.error ? 'err' : ''} ${s.graded ? 'graded' : ''}" title="${esc(tip)}"><span class="check">${s.graded ? '✓' : ''}</span>${score ? `<span class="score">${esc(score)}</span>` : ''}${esc(s.name)}</li>`;
   }).join('');
-  const graded = state.subs.filter((s) => s.graded).length;
-  $('#gradedCount').textContent = state.dbOk && state.subs.length ? `${graded} / ${state.subs.length} graded` : '';
-  $('#gradeBtn').hidden = !state.dbOk || !state.sub;
-  $('#gradeBtn').textContent = state.sub?.graded ? '✓ Graded' : 'Mark as graded';
-  $('#gradeBtn').title = state.sub?.graded ? `Graded by ${state.sub.gradedBy || '?'}. Click (or press g) to undo` : 'Click or press g';
-  $('#gradeBtn').classList.toggle('done', !!state.sub?.graded);
+  const graded = state.subs.filter((s) => s.graded);
+  const scored = graded.filter((s) => s.score != null);
+  const avg = scored.length ? ` · avg ${(scored.reduce((t, s) => t + s.score, 0) / scored.length).toFixed(1)}` : '';
+  $('#gradedCount').textContent = state.dbOk && state.subs.length ? `${graded.length} / ${state.subs.length} graded${avg}` : '';
+  const cur = state.sub;
+  $('#gradeBtn').hidden = !state.dbOk || !cur;
+  $('#gradeBtn').textContent = cur?.graded ? `✓ ${scoreOf(cur) || 'Graded'}` : 'Mark as graded';
+  $('#gradeBtn').title = cur?.graded ? `Graded by ${cur.gradedBy || '?'}. Click (or press g) to undo` : 'Click or press g';
+  $('#gradeBtn').classList.toggle('done', !!cur?.graded);
+  renderGradePanel();
 }
 
 $('#filter').oninput = renderSubs;
 $('#hideGraded').onchange = renderSubs;
 
-// ---------- Grading status ----------
+// ---------- Grading ----------
 
-async function toggleGraded(sub = state.sub) {
-  if (!sub || !state.dbOk) return;
-  const prev = { graded: sub.graded, gradedBy: sub.gradedBy, updatedAt: sub.updatedAt };
-  sub.graded = !sub.graded; // optimistic; reverted below if the save fails
+const GRADE_KEYS = ['graded', 'score', 'maxScore', 'rubric', 'comment', 'gradedBy', 'updatedAt'];
+const commentEl = $('#comment');
+let commentTimer = null; // pending debounced comment save; also means "unsaved edits"
+let metaFlash = null; // transient text for #gradeMeta, e.g. "Saved"
+
+// Sends a patch ({ rubric: i } | { graded } | { comment }) and applies the saved grade. The
+// optimistic fields show immediately and are rolled back if the save fails.
+async function saveGrade(sub, patch, optimistic) {
+  if (!sub || !state.dbOk) return false;
+  const prev = Object.fromEntries(GRADE_KEYS.map((k) => [k, sub[k]]));
+  const url = `/api/assignments/${encodeURIComponent(state.assignment)}/${encodeURIComponent(sub.id)}/grade`;
+  Object.assign(sub, optimistic);
   renderSubs();
   try {
-    const r = await fetch(`/api/assignments/${encodeURIComponent(state.assignment)}/${encodeURIComponent(sub.id)}/grade`, {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ graded: sub.graded }),
-    });
+    const r = await fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) });
     const body = await r.json();
     if (!r.ok) throw new Error(body.error || r.statusText);
-    Object.assign(sub, body);
+    for (const k of GRADE_KEYS) sub[k] = body[k]; // fields missing from the saved doc are cleared
+    renderSubs();
+    return true;
   } catch (e) {
     Object.assign(sub, prev);
-    alert(`Could not save grading status: ${e.message}`);
+    renderSubs();
+    alert(`Could not save grade: ${e.message}`);
+    return false;
   }
-  renderSubs();
+}
+
+function toggleGraded(sub = state.sub) {
+  if (!sub) return;
+  const graded = !sub.graded;
+  return saveGrade(sub, { graded }, { graded, score: undefined, maxScore: undefined, rubric: undefined });
+}
+
+// Grades with rubric item i. With toggle (a click), choosing the selected item clears the grade.
+function pickRubric(i, toggle = false, sub = state.sub) {
+  const item = state.rubric[i];
+  if (!sub || !item) return;
+  const selected = sub.graded && sub.score === item.points && sub.rubric === item.label;
+  if (selected) return toggle ? toggleGraded(sub) : undefined;
+  const maxScore = Math.max(...state.rubric.map((r) => r.points));
+  return saveGrade(sub, { rubric: i }, { graded: true, score: item.points, maxScore, rubric: item.label });
 }
 
 $('#gradeBtn').onclick = () => toggleGraded();
+$('#rubric').onclick = (e) => { const b = e.target.closest('button[data-i]'); if (b) pickRubric(Number(b.dataset.i), true); };
+
+function setMeta(text, cls, ms) {
+  clearTimeout(metaFlash?.timer);
+  metaFlash = { text, cls };
+  if (ms) metaFlash.timer = setTimeout(() => { metaFlash = null; renderGradePanel(); }, ms);
+  renderGradePanel();
+}
+
+// Saves the comment box for sub if it differs from what is stored
+function saveComment(sub = state.sub) {
+  clearTimeout(commentTimer);
+  commentTimer = null;
+  if (!sub || !state.dbOk) return;
+  const text = commentEl.value.trim();
+  if (text === (sub.comment || '')) return;
+  if (sub === state.sub) setMeta('Saving…', 'saving');
+  saveGrade(sub, { comment: text }, { comment: text || undefined }).then((ok) => {
+    if (sub !== state.sub) return;
+    if (ok) setMeta('Saved', 'saved', 1500); else { metaFlash = null; renderGradePanel(); }
+  });
+}
+
+commentEl.oninput = () => { clearTimeout(commentTimer); commentTimer = setTimeout(saveComment, 800); };
+commentEl.onblur = () => saveComment();
+commentEl.onkeydown = (e) => {
+  // Esc or Ctrl/Cmd+Enter leaves the box (which saves) so j / k / digits work again
+  if (e.key === 'Escape' || (e.key === 'Enter' && (e.ctrlKey || e.metaKey))) { e.preventDefault(); commentEl.blur(); }
+};
+
+function renderGradePanel() {
+  const sub = state.sub;
+  const panel = $('#gradePanel');
+  panel.hidden = !state.dbOk || !sub;
+  if (panel.hidden) return;
+  $('#rubric').innerHTML = state.rubric.map((r, i) => {
+    const on = sub.graded && sub.score === r.points && sub.rubric === r.label;
+    return `<button data-i="${i}" class="${on ? 'selected' : ''}" title="${on ? 'Click to clear this grade' : `Press ${i + 1}`}"><kbd>${i + 1}</kbd><b>+${r.points}</b>${esc(r.label)}</button>`;
+  }).join('');
+  // Never overwrite text being typed or not yet saved
+  if (document.activeElement !== commentEl && !commentTimer) commentEl.value = sub.comment || '';
+  const meta = $('#gradeMeta');
+  if (metaFlash) { meta.textContent = metaFlash.text; meta.className = metaFlash.cls; return; }
+  meta.className = '';
+  meta.textContent = sub.graded ? `Graded by ${sub.gradedBy || '?'} · ${when(sub.updatedAt)}`
+    : sub.comment ? `Comment by ${sub.gradedBy || '?'} · not graded yet` : 'Not graded yet';
+}
 
 // Pick up other graders' changes
 setInterval(async () => {
@@ -141,12 +230,16 @@ setInterval(async () => {
   const aid = state.assignment;
   const grades = await api(`/api/assignments/${encodeURIComponent(aid)}/grades`).catch(() => null);
   if (!grades || grades.error || aid !== state.assignment) return;
-  for (const s of state.subs) Object.assign(s, { graded: false, gradedBy: undefined, updatedAt: undefined }, grades[s.id]);
+  const cleared = Object.fromEntries(GRADE_KEYS.map((k) => [k, undefined]));
+  for (const s of state.subs) Object.assign(s, cleared, { graded: false }, grades[s.id]);
   renderSubs();
 }, 10000);
 $('#subList').onclick = (e) => { const li = e.target.closest('li'); if (li) selectSub(li.dataset.id); };
 
 async function selectSub(id) {
+  if (commentTimer) saveComment(); // unsaved comment for the student we're leaving
+  clearTimeout(metaFlash?.timer);
+  metaFlash = null;
   state.sub = state.subs.find((s) => s.id === id);
   renderSubs();
   const { files, entry, port } = await api(`/api/assignments/${state.assignment}/${id}/files`);
@@ -284,6 +377,7 @@ document.addEventListener('keydown', (e) => {
   if (['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement.tagName)) return;
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   if (e.key === 'g') return toggleGraded();
+  if (/^[1-9]$/.test(e.key)) return pickRubric(Number(e.key) - 1);
   if (e.key !== 'j' && e.key !== 'k') return;
   const list = visibleSubs();
   const i = list.findIndex((s) => s.id === state.sub?.id);

@@ -56,3 +56,27 @@ li.graded { color: #57606a; }
 #sourceBody pre code { font-size: 13px; padding: 14px; min-height: 100%; }
 #sourceBody img, #sourceBody video { max-width: 100%; display: block; margin: 20px auto; background: repeating-conic-gradient(#eee 0 25%, #fff 0 50%) 0 0/16px 16px; }
 .empty { padding: 30px; color: #8c959f; text-align: center; }
+
+/* The hidden attribute must beat the display rules below (e.g. #gradePanel's flex) */
+[hidden] { display: none !important; }
+
+/* Scores in the student list */
+li .score { display: inline-block; margin-right: 6px; padding: 0 5px; border-radius: 99px; font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums; background: #dafbe1; color: #1a7f37; }
+li.active .score { background: #1a7f37; color: #fff; }
+
+/* Grading panel under the viewer: rubric buttons + comment */
+#gradePanel { display: flex; gap: 12px; align-items: flex-start; padding: 8px 10px; background: #fff; border-top: 1px solid #d0d7de; }
+#rubric { display: flex; flex-wrap: wrap; gap: 6px; max-width: 55%; }
+#rubric button { background: #fff; color: #1f2328; border-color: #d0d7de; text-align: left; }
+#rubric button:hover { background: #f3f4f6; }
+#rubric button kbd { font: 11px ui-monospace, monospace; color: #8c959f; margin-right: 6px; }
+#rubric button b { display: inline-block; min-width: 2.2em; }
+#rubric button.selected { background: #dafbe1; color: #1a7f37; border: 2px solid #1a7f37; padding: 5px 9px; font-weight: 600; }
+#rubric button.selected kbd { color: #1a7f37; }
+#rubric button.selected:hover { background: #ffebe9; color: #cf222e; border-color: #cf222e; }
+.commentBox { flex: 1; min-width: 200px; display: flex; flex-direction: column; gap: 4px; }
+.commentBox textarea { width: 100%; resize: vertical; font: inherit; padding: 6px 10px; border: 1px solid #d0d7de; border-radius: 6px; }
+.commentBox textarea:focus { outline: none; border-color: #1f6feb; box-shadow: 0 0 0 2px #ddf4ff; }
+#gradeMeta { font-size: 12px; color: #57606a; min-height: 1.4em; }
+#gradeMeta.saving { color: #8c959f; }
+#gradeMeta.saved { color: #1a7f37; }

@@ -14,9 +14,9 @@ cd CubstartHomeworkGrader
 npm install
 ```
 
-## Grading status (MongoDB, optional)
+## Grades and comments (MongoDB, optional)
 
-To track which students have been graded, shared across every grader, copy `.env.example` to `.env` and fill it in:
+To record grades and comments, shared across every grader, copy `.env.example` to `.env` and fill it in:
 
 ```sh
 MONGODB_URI=mongodb+srv://user:password@cluster.example.mongodb.net/
@@ -25,7 +25,16 @@ MONGODB_DB=cubstart-grader
 GRADER_NAME=Your Name
 ```
 
-Statuses are stored in the `grades` collection, one document per assignment and submission (`assignmentId`, `submissionId`, `graded`, `gradedBy`, `updatedAt`, plus the student's name and email). Without `MONGODB_URI` everything else still works; the header just shows "Grading status off".
+Grades are stored in the `grades` collection, one document per assignment and submission: `assignmentId`, `submissionId`, the student's `name` and `email`, `graded`, and, once a rubric item is picked, `score`, `maxScore` and `rubric` (the item's label), plus an optional `comment`. `gradedBy` and `updatedAt` record the last change. Without `MONGODB_URI` everything else still works; the header just shows "Grading status off".
+
+The rubric is a single choice, the same for every assignment, defined as `RUBRIC` in `server.js`:
+
+| Points | Label |
+| --- | --- |
+| 5 | Uses all required elements |
+| 4 | Uses most required elements |
+| 2 | Uses some required elements |
+| 0 | No work |
 
 ## Running
 
@@ -35,7 +44,7 @@ npm start        # or: npm run start
 
 Then open <http://localhost:3000>. In Gradescope, open the assignment → **Review Grades** → **Export Submissions**, and drop the downloaded zip onto the page (or click **Import zip**). Re-importing an assignment's export replaces the earlier import; grading status is kept.
 
-Mark a student graded with the **Mark graded** button or the `g` key. Graded students get a ✓, **Hide graded** filters them out, and other graders' changes show up within about 10 seconds.
+Grade a student from the panel under the preview: click a rubric item or press its number (`1`-`4`). Graded students get a ✓ and their score (for example `5/5`) in the list, and the count line shows the class average. Clicking the selected item again, or the ✓ button, clears the grade; `g` toggles graded without a score. The comment box saves on its own shortly after you stop typing, when you click elsewhere, or on Ctrl/Cmd+Enter; Esc leaves it so `j`/`k` work again. **Hide graded** filters graded students out, and other graders' changes show up within about 10 seconds.
 
 The grader UI runs on port `3000`. To use a different port, set `PORT`:
 
@@ -45,6 +54,8 @@ $env:PORT=4000; npm start    # Windows PowerShell
 ```
 
 Imported submissions are stored in `data/`.
+
+Student pages sometimes reference assets with paths that only worked on the student's own setup: `/assets/photo.jpg` while `index.html` sits inside `HW1/`, a GitHub Pages path like `/repo-name/HW1/assets/photo.jpg`, or the wrong letter case. The preview falls back to the matching file inside the submission, so the page looks the way the student saw it. Assets that were never uploaded still show as broken.
 
 ## Security
 

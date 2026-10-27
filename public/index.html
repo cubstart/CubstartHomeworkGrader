@@ -45,6 +45,7 @@
 
   <section id="viewer">
     <div class="tabs">
+      <button data-tab="api" hidden>API</button>
       <button data-tab="preview" class="active">Preview</button>
       <button data-tab="source">Source</button>
       <span id="current"></span>
@@ -58,6 +59,35 @@
     </div>
     <div id="sourcePane" class="pane" hidden>
       <div id="sourceBody" class="empty">Pick a file on the left.</div>
+    </div>
+    <!-- Node.js submissions: the student's server runs in a sandboxed process and this pane talks to it -->
+    <div id="apiPane" class="pane" hidden>
+      <div class="apiBar">
+        <span id="appStatus" class="pill">starting…</span>
+        <span id="appEntry"></span>
+        <button id="testBtn" class="secondary">Run tests</button>
+        <button id="restartBtn" class="secondary" title="Restart the student's server">Restart</button>
+      </div>
+      <section class="apiSection">
+        <div class="paneTitle">Tests <span id="testSummary"></span></div>
+        <table id="testResults"></table>
+        <p class="hint" id="testHint" hidden>Click a row to see that request's response below.</p>
+      </section>
+      <section class="apiSection">
+        <div class="paneTitle">Request</div>
+        <form id="reqForm" class="reqForm" autocomplete="off">
+          <select id="reqMethod"><option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option></select>
+          <input id="reqPath" value="/cards" placeholder="/cards" spellcheck="false">
+          <button type="submit">Send</button>
+        </form>
+        <textarea id="reqBody" rows="2" placeholder='JSON body for POST/PUT/PATCH, e.g. {"front": "Capital of France?", "back": "Paris"}' spellcheck="false"></textarea>
+        <div id="reqMeta" class="hint"></div>
+        <pre id="reqResponse" class="empty">Send a request, or click a test row, to see a response.</pre>
+      </section>
+      <section class="apiSection">
+        <div class="paneTitle">Console</div>
+        <pre id="appLog" class="empty">No output yet.</pre>
+      </section>
     </div>
     <!-- Rubric + comment for the selected student; shown only while MongoDB is connected -->
     <div id="gradePanel" hidden>

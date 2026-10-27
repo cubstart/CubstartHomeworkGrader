@@ -6,6 +6,7 @@ const fs = require('fs');
 const AdmZip = require('adm-zip');
 const yaml = require('js-yaml');
 const { MongoClient } = require('mongodb');
+const nodeApps = require('./node-apps');
 
 try { process.loadEnvFile(path.join(__dirname, '.env')); } catch { /* no .env file */ }
 
@@ -135,8 +136,10 @@ async function runImport(job, buf, filename) {
   if (!hasMeta) job.log('No submission_metadata.yml found; students will be listed by submission id');
   if (metaError) job.log(`Could not read submission_metadata.yml (${metaError}); students will be listed by submission id`);
 
-  // An export is the full set of submissions, so replace whatever was imported before
+  // An export is the full set of submissions, so replace whatever was imported before.
+  // Running student servers for it are stopped first: their folders are about to go.
   const assignDir = path.join(DATA_DIR, assignmentId);
+  await nodeApps.stopApps(`${assignmentId}/`);
   fs.rmSync(assignDir, { recursive: true, force: true });
   fs.mkdirSync(assignDir, { recursive: true });
   const manifest = { assignmentId, source: filename, importedAt: new Date().toISOString(), submissions: {} };
@@ -454,11 +457,68 @@ app.get('/api/assignments/:aid/:sid/files', async (req, res) => {
   const aid = path.basename(req.params.aid);
   const sid = path.basename(req.params.sid);
   const dir = path.join(DATA_DIR, aid, sid);
-  if (!fs.existsSync(dir)) return res.json({ files: [], entry: null, port: null });
+  if (!fs.existsSync(dir)) return res.json({ files: [], entry: null, nodeEntry: null, port: null, app: null });
   try {
     const files = walk(dir);
-    res.json({ files, entry: findEntryHtml(files), port: await previewPort(aid, sid) });
+    // A submission with a Node server file also gets that server started (app), on top of the
+    // static port the Source tab reads files from
+    const nodeEntry = nodeApps.findEntryJs(files, dir);
+    const app = nodeEntry ? nodeApps.appInfo(nodeApps.getApp(`${aid}/${sid}`, dir, nodeEntry)) : null;
+    res.json({ files, entry: findEntryHtml(files), nodeEntry, port: await previewPort(aid, sid), app });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ---------- Student Node.js servers ----------
+
+// Resolves the submission folder and its server file for the routes below, or responds 404
+function nodeSub(req, res) {
+  const aid = path.basename(req.params.aid);
+  const sid = path.basename(req.params.sid);
+  const dir = path.join(DATA_DIR, aid, sid);
+  if (!fs.existsSync(dir)) { res.status(404).json({ error: 'Unknown submission' }); return null; }
+  const entry = nodeApps.findEntryJs(walk(dir), dir);
+  if (!entry) { res.status(404).json({ error: 'This submission has no Node.js server file' }); return null; }
+  return { key: `${aid}/${sid}`, dir, entry };
+}
+
+// Status and console output; starts the server if it isn't running
+app.get('/api/assignments/:aid/:sid/app', (req, res) => {
+  const s = nodeSub(req, res);
+  if (s) res.json(nodeApps.appInfo(nodeApps.getApp(s.key, s.dir, s.entry)));
+});
+
+app.post('/api/assignments/:aid/:sid/app/restart', async (req, res) => {
+  const s = nodeSub(req, res);
+  if (!s) return;
+  const rec = nodeApps.getApp(s.key, s.dir, s.entry, true);
+  await rec.ready;
+  res.json(nodeApps.appInfo(rec));
+});
+
+// Proxies one request from the grader to the student server. Body: { method, path, headers?, body? }
+// (body is the raw string). Responds with the result of the request plus the app's status.
+app.post('/api/assignments/:aid/:sid/app/request', async (req, res) => {
+  const s = nodeSub(req, res);
+  if (!s) return;
+  const spec = { method: 'GET', path: '/', ...(req.body || {}) };
+  const bad = nodeApps.validateRequest(spec);
+  if (bad) return res.status(400).json({ error: bad });
+  const rec = nodeApps.getApp(s.key, s.dir, s.entry);
+  await rec.ready;
+  const result = await nodeApps.appRequest(rec, spec);
+  res.json({ ...result, app: nodeApps.appInfo(rec) });
+});
+
+// Runs the assignment's Postman-style checks against a fresh server (restarted unless it was
+// just started and has had no requests yet). Responds { name, results: [...], app }.
+app.post('/api/assignments/:aid/:sid/app/test', async (req, res) => {
+  const s = nodeSub(req, res);
+  if (!s) return;
+  let rec = nodeApps.getApp(s.key, s.dir, s.entry);
+  await rec.ready;
+  if (rec.status !== 'running' || rec.requests > 0) { rec = nodeApps.getApp(s.key, s.dir, s.entry, true); await rec.ready; }
+  const results = rec.status === 'running' ? await nodeApps.runTests(rec) : [];
+  res.json({ name: nodeApps.API_TESTS.name, results, app: nodeApps.appInfo(rec) });
 });
 
 listenLoopback(app, PORT)

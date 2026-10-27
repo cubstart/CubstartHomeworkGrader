@@ -4,7 +4,7 @@ This project is designed to streamline the process of viewing student submission
 
 ## Requirements
 
-- [Node.js](https://nodejs.org/) 18 or newer (includes npm)
+- [Node.js](https://nodejs.org/) 20 or newer (includes npm). Node 18 still works for static submissions, but can't run students' Node.js servers (see below).
 
 ## Installation
 
@@ -55,6 +55,16 @@ $env:PORT=4000; npm start    # Windows PowerShell
 
 Imported submissions are stored in `data/`.
 
+## Node.js submissions (HW 6: Flashcard API)
+
+A submission whose entry file is a Node.js server (`index.js` that requires `express` or calls `listen`) gets an **API** tab instead of a preview. The grader starts the student's server in a sandboxed process and the tab stands in for Postman:
+
+- **Tests** run as soon as the student is opened, against a freshly started server: add three cards with `POST /new`, `GET /cards`, `GET /card/2`, `GET /random`, delete the card at index 1 (`DELETE /card/1`, falling back to `/cards/1`, `/delete/1`, `/remove/1`, …) and `GET /cards` again. Each row shows the status, time and why it failed; click a row to see that response. **Run tests** restarts the server and runs them again. The steps are `API_TESTS` in `node-apps.js`.
+- **Request** sends any method, path and JSON body and shows the response.
+- **Console** shows the server's stdout and stderr, so a syntax error or a crash on startup shows up here. **Restart** relaunches the server.
+
+Students submit `index.js` without `node_modules`, so their code runs with the modules in `student-runtime/` on the path (`express` 4, `body-parser`, `cors`; `npm install` installs them too). Their `app.listen(3000)` is redirected to an OS-assigned loopback port, so several students' servers can run at once and nothing needs port 3000. At most 3 run at a time; the least recently used is stopped, as is any server idle for 10 minutes.
+
 Student pages sometimes reference assets with paths that only worked on the student's own setup: `/assets/photo.jpg` while `index.html` sits inside `HW1/`, a GitHub Pages path like `/repo-name/HW1/assets/photo.jpg`, or the wrong letter case. The preview falls back to the matching file inside the submission, so the page looks the way the student saw it. Assets that were never uploaded still show as broken.
 
 ## Security
@@ -65,5 +75,6 @@ Student submissions are untrusted code, so the app:
 - **Serves each submission from its own port.** That makes each one a separate browser origin, so one student's code can't read another student's files or the class roster. The ports are picked by the OS and shown in the preview URL.
 - **Sandboxes previews.** Student pages can't navigate the grader tab or open popups, and can't install service workers.
 - **Limits extraction.** A submission is rejected if it unzips to more than 200 MB or 5,000 files.
+- **Sandboxes student servers.** A Node.js submission runs under Node's [permission model](https://nodejs.org/api/permissions.html): it can read its own folder and `student-runtime/`, and nothing else. No file writes, no child processes, no workers, and none of the grader's environment (so not `MONGODB_URI`). Its server binds to loopback only. The permission model can't block outbound network, so a hostile submission could still make requests out; it runs with your user's network access.
 
 Open the UI at `localhost`, `127.0.0.1` or `[::1]`; other hostnames, even ones that point at your machine, are refused.

@@ -1,5 +1,6 @@
 const $ = (s) => document.querySelector(s);
-const state = { assignment: null, subs: [], sub: null, files: [], entry: null, file: null, port: null, dbOk: false, rubric: [] };
+// nodeEntry/app/tests: the student's Node.js server file, its process status, and test results (API tab)
+const state = { assignment: null, subs: [], sub: null, files: [], entry: null, file: null, port: null, dbOk: false, rubric: [], nodeEntry: null, app: null, tests: null };
 
 const IMG = /\.(png|jpe?g|gif|svg|webp|ico|bmp|avif)$/i;
 const MEDIA = /\.(mp4|webm|mov|mp3|wav|ogg)$/i;
@@ -242,13 +243,18 @@ async function selectSub(id) {
   metaFlash = null;
   state.sub = state.subs.find((s) => s.id === id);
   renderSubs();
-  const { files, entry, port } = await api(`/api/assignments/${state.assignment}/${id}/files`);
+  const { files, entry, port, nodeEntry, app } = await api(`/api/assignments/${state.assignment}/${id}/files`);
+  if (state.sub?.id !== id) return; // the grader moved on while this loaded
   state.port = port;
   state.files = files;
   state.entry = entry;
+  state.nodeEntry = nodeEntry || null;
+  state.app = app || null;
+  state.tests = null;
   renderTree();
   showPreview();
-  openFile(entry || files[0]?.path || null, false);
+  openFile(nodeEntry || entry || files[0]?.path || null, false);
+  if (nodeEntry) runTests();
 }
 
 // ---------- File tree ----------
@@ -277,14 +283,17 @@ function setTab(tab) {
   document.querySelectorAll('.tabs button[data-tab]').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
   $('#previewPane').hidden = tab !== 'preview';
   $('#sourcePane').hidden = tab !== 'source';
+  $('#apiPane').hidden = tab !== 'api';
 }
 document.querySelectorAll('.tabs button[data-tab]').forEach((b) => (b.onclick = () => setTab(b.dataset.tab)));
 
 function showPreview(switchTab = true) {
   const has = !!state.entry;
+  const node = !!state.nodeEntry;
   $('#frame').hidden = !has;
   $('#noPreview').hidden = has;
   $('#openTab').hidden = !has;
+  $('.tabs button[data-tab="api"]').hidden = !node;
   if (has) {
     const u = fileUrl(state.entry);
     $('#frame').src = u;
@@ -294,7 +303,8 @@ function showPreview(switchTab = true) {
     $('#frame').src = 'about:blank';
     $('#current').textContent = '';
   }
-  if (switchTab) setTab(has ? 'preview' : 'source');
+  if (node) { $('#current').textContent = state.nodeEntry; renderApp(); }
+  if (switchTab) setTab(node ? 'api' : has ? 'preview' : 'source');
 }
 
 async function openFile(p, switchTab) {
@@ -384,6 +394,134 @@ document.addEventListener('keydown', (e) => {
   const next = list[i + (e.key === 'j' ? 1 : -1)];
   if (next) selectSub(next.id);
 });
+
+// ---------- API tab (Node.js submissions) ----------
+
+// The student's server runs as a sandboxed process on the grader; everything here goes through
+// the /app proxy endpoints, so POST/DELETE requests work without Postman.
+const STATUS_TEXT = { starting: 'Starting…', running: 'Running', 'no-server': 'No server started', exited: 'Exited', failed: 'Could not start' };
+const appUrl = (suffix) => `/api/assignments/${encodeURIComponent(state.assignment)}/${encodeURIComponent(state.sub.id)}/app${suffix}`;
+const appPost = (suffix, body = {}) => fetch(appUrl(suffix), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then((r) => r.json());
+
+function renderApp() {
+  const a = state.app;
+  const el = $('#appStatus');
+  const ok = a?.status === 'running';
+  el.textContent = !a ? 'Not started' : ok ? `Running on port ${a.port}` : a.status === 'exited' ? `Exited${a.exitCode != null ? ` (code ${a.exitCode})` : ''}` : STATUS_TEXT[a.status] || a.status;
+  el.className = 'pill ' + (ok ? 'ok' : !a || a.status === 'starting' ? '' : 'bad');
+  $('#appEntry').textContent = a?.error && !ok ? a.error : state.nodeEntry || '';
+  $('#appEntry').title = a?.error || '';
+  const log = $('#appLog');
+  if (a?.logs?.length) {
+    log.className = '';
+    log.innerHTML = a.logs.map((l) => `<span class="${l.stream}">${esc(l.line)}</span>`).join('\n');
+    log.scrollTop = 1e9;
+  } else {
+    log.className = 'empty';
+    log.textContent = a?.status === 'starting' ? 'Starting…' : 'No output.';
+  }
+  renderTests();
+}
+
+function renderTests() {
+  const t = state.tests;
+  const table = $('#testResults');
+  const results = t?.results || [];
+  $('#testHint').hidden = !results.length;
+  $('#testSummary').textContent = results.length ? `${results.filter((r) => r.pass).length} / ${results.length} passed · ${t.name}` : '';
+  if (!t) { table.innerHTML = `<tr><td class="empty">${state.testing ? 'Starting the server and running tests…' : 'Not run.'}</td></tr>`; return; }
+  if (!results.length) { table.innerHTML = `<tr><td class="empty">Could not run: ${esc(t.error || state.app?.error || 'the server is not running')}</td></tr>`; return; }
+  table.innerHTML = results.map((r, i) => `<tr data-i="${i}" class="${r.pass ? 'pass' : 'fail'} ${i === state.testRow ? 'active' : ''}" title="Show this response">
+    <td class="mark">${r.pass ? '✓' : '✗'}</td><td>${esc(r.name)}</td><td class="req">${esc(r.method)} ${esc(r.path)}</td>
+    <td class="status">${r.ok ? `${r.status} · ${r.ms} ms` : ''}</td><td class="reason">${esc(r.reason || '')}${r.tried ? ` (tried ${esc(r.tried.join(', '))})` : ''}</td></tr>`).join('');
+}
+
+// Restarts the server (fresh state) and runs the assignment's checks against it
+async function runTests() {
+  const sub = state.sub;
+  if (!sub || !state.nodeEntry) return;
+  state.tests = null;
+  state.testRow = null;
+  state.testing = true;
+  $('#testBtn').disabled = true;
+  renderTests();
+  const r = await appPost('/test').catch((e) => ({ error: e.message }));
+  if (sub !== state.sub) return;
+  state.testing = false;
+  $('#testBtn').disabled = false;
+  if (r.app) state.app = r.app;
+  state.tests = r.error ? { name: 'Tests', results: [], error: r.error } : r;
+  renderApp();
+}
+
+async function restartApp() {
+  const sub = state.sub;
+  if (!sub || !state.nodeEntry) return;
+  $('#restartBtn').disabled = true;
+  state.app = { ...state.app, status: 'starting', port: null, error: null, logs: [] };
+  state.tests = null;
+  renderApp();
+  const a = await appPost('/restart').catch((e) => ({ status: 'failed', error: e.message, logs: [] }));
+  $('#restartBtn').disabled = false;
+  if (sub !== state.sub) return;
+  state.app = a;
+  renderApp();
+}
+
+function showResponse(spec, r) {
+  const meta = $('#reqMeta');
+  const out = $('#reqResponse');
+  const line = `${spec.method} ${spec.path}${spec.body ? ` ${spec.body}` : ''}`;
+  if (!r.ok) {
+    meta.className = 'hint bad';
+    meta.textContent = `${line} → ${r.error || 'failed'}`;
+    out.className = 'empty';
+    out.textContent = r.error || 'No response';
+    return;
+  }
+  meta.className = 'hint' + (r.status >= 400 ? ' bad' : '');
+  meta.textContent = `${line} → HTTP ${r.status} · ${r.ms} ms · ${r.headers?.['content-type'] || 'no content-type'}${r.truncated ? ' · truncated' : ''}`;
+  let body = r.body;
+  try { body = JSON.stringify(JSON.parse(r.body), null, 2); } catch { /* not JSON: show as is */ }
+  out.className = body ? '' : 'empty';
+  out.textContent = body || '(empty body)';
+}
+
+async function sendRequest(spec) {
+  const sub = state.sub;
+  if (!sub || !state.nodeEntry) return;
+  state.testRow = null;
+  renderTests();
+  $('#reqMeta').className = 'hint';
+  $('#reqMeta').textContent = 'Sending…';
+  const r = await appPost('/request', spec).catch((e) => ({ error: e.message }));
+  if (sub !== state.sub) return;
+  if (r.app) { state.app = r.app; renderApp(); }
+  showResponse(spec, r);
+}
+
+$('#testBtn').onclick = () => runTests();
+$('#restartBtn').onclick = () => restartApp();
+// A test row shows the response it already got; it is not sent again (that would change the server's state)
+$('#testResults').onclick = (e) => {
+  const tr = e.target.closest('tr[data-i]');
+  const r = state.tests?.results?.[tr?.dataset.i];
+  if (!r) return;
+  state.testRow = Number(tr.dataset.i);
+  renderTests();
+  showResponse(r, r);
+};
+$('#reqForm').onsubmit = (e) => {
+  e.preventDefault();
+  const method = $('#reqMethod').value;
+  const body = $('#reqBody').value.trim();
+  sendRequest({ method, path: $('#reqPath').value.trim() || '/', body: body && method !== 'GET' ? body : undefined });
+};
+for (const el of ['#reqPath', '#reqBody']) $(el).onkeydown = (e) => { if (e.key === 'Escape') e.target.blur(); };
+$('#reqBody').onkeydown = (e) => {
+  if (e.key === 'Escape') e.target.blur();
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); $('#reqForm').requestSubmit(); }
+};
 
 function esc(s) { return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
 

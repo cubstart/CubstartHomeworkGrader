@@ -379,25 +379,46 @@ app.get('/api/jobs/:id', (req, res) => {
   res.json(rest);
 });
 
-app.get('/api/assignments', (req, res) => {
+// Imported assignments (local: true), plus assignments that only have grades in MongoDB because
+// another grader imported them (local: false). Those list their graded students without code.
+app.get('/api/assignments', async (req, res) => {
   const list = fs.readdirSync(DATA_DIR, { withFileTypes: true })
     .filter((d) => d.isDirectory() && fs.existsSync(path.join(DATA_DIR, d.name, 'manifest.json')))
     .map((d) => {
       const m = JSON.parse(fs.readFileSync(path.join(DATA_DIR, d.name, 'manifest.json'), 'utf8'));
-      return { assignmentId: m.assignmentId, source: m.source, count: Object.keys(m.submissions).length };
+      return { assignmentId: m.assignmentId, source: m.source, count: Object.keys(m.submissions).length, local: true };
     });
+  if (db.grades) {
+    const remote = await db.grades.aggregate([{ $group: { _id: '$assignmentId', count: { $sum: 1 } } }]).toArray().catch(() => []);
+    for (const r of remote) {
+      if (typeof r._id === 'string' && !list.some((a) => a.assignmentId === r._id)) {
+        list.push({ assignmentId: r._id, source: null, count: r.count, local: false });
+      }
+    }
+  }
   res.json(list);
 });
 
 app.get('/api/assignments/:aid', async (req, res) => {
   const m = readManifest(req.params.aid);
-  if (!m) return res.status(404).end();
+  if (!m) {
+    // Not imported here: build the student list from the grade documents, which carry name and email
+    if (!db.grades) return res.status(404).end();
+    try {
+      const docs = await db.grades.find({ assignmentId: req.params.aid }, { projection: { ...GRADE_FIELDS, name: 1, email: 1 } }).toArray();
+      if (!docs.length) return res.status(404).end();
+      const subs = docs
+        .map(({ submissionId, ...g }) => ({ id: submissionId, ...g, name: g.name || `Submission ${submissionId}`, email: g.email || null, graded: !!g.graded }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+      return res.json({ assignmentId: req.params.aid, local: false, submissions: subs });
+    } catch (e) { return res.status(500).json({ error: e.message }); }
+  }
   // The submission list still loads if MongoDB is down; it just has no grading status
   const grades = db.grades ? await gradesFor(m.assignmentId).catch(() => ({})) : {};
   const subs = Object.values(m.submissions)
     .map((s) => ({ ...s, graded: false, ...grades[s.id] }))
     .sort((a, b) => a.name.localeCompare(b.name));
-  res.json({ ...m, submissions: subs });
+  res.json({ ...m, local: true, submissions: subs });
 });
 
 // Polled by the UI so other graders' changes show up
@@ -412,8 +433,16 @@ app.get('/api/assignments/:aid/grades', requireDb, async (req, res) => {
 //   { comment: "..." }                set the comment; an empty string removes it
 // Responds with the saved grade fields (GRADE_FIELDS).
 app.put('/api/assignments/:aid/:sid/grade', requireDb, async (req, res) => {
-  const m = readManifest(req.params.aid);
-  const s = m?.submissions[req.params.sid];
+  let m = readManifest(req.params.aid);
+  let s = m?.submissions[req.params.sid];
+  if (!m) {
+    // Not imported here: only students that already have a grade document can be edited
+    const doc = await db.grades.findOne({ assignmentId: req.params.aid, submissionId: req.params.sid }, { projection: { name: 1, email: 1 } }).catch(() => null);
+    if (doc) {
+      m = { assignmentId: req.params.aid };
+      s = { id: req.params.sid, name: doc.name, email: doc.email };
+    }
+  }
   if (!s) return res.status(404).json({ error: 'Unknown submission' });
   const { rubric, graded, comment } = req.body || {};
   const set = { gradedBy: GRADER, updatedAt: new Date(), name: s.name, email: s.email };

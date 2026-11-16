@@ -15,6 +15,7 @@ const api = (p, opts) => fetch(p, opts).then((r) => r.json());
 
 async function loadStatus() {
   const s = await api('/api/status');
+  const wasOk = state.dbOk;
   state.dbOk = s.db === 'connected';
   state.rubric = s.rubric || [];
   if (state.rubric.length) $('#hint').textContent = `j / k to switch students · 1-${state.rubric.length} to grade · g to toggle graded · Esc leaves the comment box`;
@@ -24,6 +25,8 @@ async function loadStatus() {
   el.className = 'pill ' + (state.dbOk ? 'ok' : 'bad');
   if (s.db === 'connecting') setTimeout(loadStatus, 2000);
   renderSubs();
+  // Once MongoDB connects, assignments with grades but no local import become available
+  if (state.dbOk && !wasOk && state.listLoaded) loadAssignments(state.assignment);
 }
 
 async function importZip(file) {
@@ -71,8 +74,9 @@ window.addEventListener('drop', (e) => {
 
 async function loadAssignments(select) {
   const list = await api('/api/assignments');
+  state.listLoaded = true;
   $('#assignment').innerHTML = list.length
-    ? list.map((a) => `<option value="${esc(a.assignmentId)}">Assignment ${esc(a.assignmentId)} (${a.count})</option>`).join('')
+    ? list.map((a) => `<option value="${esc(a.assignmentId)}">Assignment ${esc(a.assignmentId)} (${a.count})${a.local ? '' : ' · grades only'}</option>`).join('')
     : '<option>No assignments imported yet</option>';
   const pick = select || localStorage.getItem('assignment') || list[0]?.assignmentId;
   if (pick && list.some((a) => a.assignmentId === pick)) {
@@ -87,8 +91,9 @@ async function loadAssignment(aid) {
   if (commentTimer) saveComment(); // unsaved comment for the student we're leaving
   state.assignment = aid;
   localStorage.setItem('assignment', aid);
-  const a = await api(`/api/assignments/${aid}`);
-  state.subs = a.submissions;
+  const a = await api(`/api/assignments/${encodeURIComponent(aid)}`).catch(() => ({}));
+  state.local = a.local !== false;
+  state.subs = a.submissions || [];
   renderSubs();
   if (state.subs.length) selectSub(state.subs[0].id);
 }
@@ -243,7 +248,8 @@ async function selectSub(id) {
   metaFlash = null;
   state.sub = state.subs.find((s) => s.id === id);
   renderSubs();
-  const { files, entry, port, nodeEntry, app } = await api(`/api/assignments/${state.assignment}/${id}/files`);
+  const empty = { files: [], entry: null, port: null, nodeEntry: null, app: null };
+  const { files, entry, port, nodeEntry, app } = state.local ? await api(`/api/assignments/${encodeURIComponent(state.assignment)}/${encodeURIComponent(id)}/files`) : empty;
   if (state.sub?.id !== id) return; // the grader moved on while this loaded
   state.port = port;
   state.files = files;
@@ -266,7 +272,7 @@ function renderTree() {
         const dir = i >= 0 ? `<span class="dir">${esc(f.path.slice(0, i + 1))}</span>` : '';
         return `<li data-path="${esc(f.path)}" class="${f.path === state.file ? 'active' : ''}" title="${esc(f.path)}">${dir}${esc(f.path.slice(i + 1))}</li>`;
       }).join('')
-    : `<li class="err">${state.sub?.error ? esc(state.sub.error) : 'No files'}</li>`;
+    : `<li class="err">${state.sub?.error ? esc(state.sub.error) : state.local ? 'No files' : 'Code not downloaded. Import this assignment\'s export zip to view it.'}</li>`;
 }
 
 $('#fileList').onclick = (e) => {
@@ -292,6 +298,7 @@ function showPreview(switchTab = true) {
   const node = !!state.nodeEntry;
   $('#frame').hidden = !has;
   $('#noPreview').hidden = has;
+  $('#noPreview').textContent = state.local ? 'No HTML file in this submission.' : 'Code not downloaded for this assignment. Import its Gradescope export zip to see the submission; grades and comments still work.';
   $('#openTab').hidden = !has;
   $('.tabs button[data-tab="api"]').hidden = !node;
   if (has) {

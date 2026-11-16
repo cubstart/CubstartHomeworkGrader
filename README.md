@@ -46,6 +46,8 @@ Then open <http://localhost:3000>. In Gradescope, open the assignment → **Revi
 
 Grade a student from the panel under the preview: click a rubric item or press its number (`1`-`4`). Graded students get a ✓ and their score (for example `5/5`) in the list, and the count line shows the class average. Clicking the selected item again, or the ✓ button, clears the grade; `g` toggles graded without a score. The comment box saves on its own shortly after you stop typing, when you click elsewhere, or on Ctrl/Cmd+Enter; Esc leaves it so `j`/`k` work again. **Hide graded** filters graded students out, and other graders' changes show up within about 10 seconds.
 
+Assignments that have grades in MongoDB but haven't been imported on your machine still appear in the assignment menu, marked **grades only**. They list every student with a grade or comment, with scores, rubric items, comments and the class average, and you can still change those grades. Their code isn't shown until you import that assignment's export zip.
+
 The grader UI runs on port `3000`. To use a different port, set `PORT`:
 
 ```sh
